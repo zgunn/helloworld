@@ -37,7 +37,7 @@ int main(int argc,char *argv[]){
 		//printf("Failed to create socket.\n");
 		exit(1);
 	}
-	strcpy(dest_ip,"185.30.166.38");
+	strcpy(dest_ip,"127.0.0.1");
 
 	char nick[9];
 	char compname[MAX_COMPUTERNAME_LENGTH+1];

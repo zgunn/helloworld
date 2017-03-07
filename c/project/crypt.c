@@ -40,6 +40,11 @@ size_t read_file_info_buf(char *filepath, unsigned char **data){
 		return 0;
 	}
 
+	bytes_read = fread(*data,1,filesiz,fp);
+	if(bytes_read == 0){
+		free(*data);
+	}
+
 	fclose(fp);
 	return bytes_read;
 }
@@ -191,9 +196,179 @@ int encrypt_file(char *infile, char *outfile, char *password){
 
 	err = gcry_mac_setkey(mac,hmac_key,HMAC_KEYSIZ);
 	if(err){
+		fprintf(stderr,"mac_setkey during encryption: %s/%s\n",gcry_strsource(err), gcry_strerror(err));
+		cleanup(handle,mac,ciphertext,packed_data,hmac);
+		return 1;
 	}
+
+	// add packed_data to MAC computation
+	err = gcry_mac_write(mac,packed_data,packed_data_len - hmac_len);
+	if(err){
+		fprintf(stderr,"mac_write during encryption: %s/%s\n",gcry_strsource(err), gcry_strerror(err));
+		cleanup(handle,mac,ciphertext,packed_data,hmac);
+		return 1;
+	}
+
+	// finalize MAC and save it in the hmac buffer
+	err = gcry_mac_read(mac,hmac,&hmac_len);
+	if(err){
+		fprintf(stderr,"mac_read during encryption: %s/%s\n",gcry_strsource(err), gcry_strerror(err));
+		cleanup(handle,mac,ciphertext,packed_data,hmac);
+		return 1;
+	}
+
+	// append packed data to file
+	if(!write_buf_to_file(outfile,packed_data,packed_data_len)){
+		cleanup(handle,mac,ciphertext,packed_data,hmac);
+		return 1;
+	}
+
+	cleanup(handle,mac,ciphertext,packed_data,hmac);
+
+	return 0;
+}
+
+int decrypt_file(char *infile,char *outfile,char *password){
+	unsigned char init_vector[AES256_BLOCKSIZ],
+			kdf_salt[KDF_SALTSIZ],
+			kdf_key[KDF_KEYSIZ],
+			aes_key[AES256_KEYSIZ],
+			hmac_key[HMAC_KEYSIZ],
+			*hmac,
+			*packed_data,
+			*ciphertext;
+	size_t blocks_required,packed_data_len,ciphertext_len,hmac_len;
+	gcry_cipher_hd_t handle;
+	gcry_mac_hd_t mac;
+	gcry_error_t err;
+
+	// read in file contents
+	if(!(packed_data_len = read_file_info_buf(infile,&packed_data))){
+		return 1;
+	}
+
+	// compute necessary lengths
+	hmac_len = gcry_mac_get_algo_maclen(GCRY_MAC_HMAC_SHA512);
+	ciphertext_len = packed_data_len - KDF_SALTSIZ - AES256_BLOCKSIZ - hmac_len;
+
+	ciphertext = malloc(ciphertext_len);
+	if(ciphertext == NULL){
+		fprintf(stderr,"Error: ciphertext is too large to fit in memory\n");
+		free(packed_data);
+		return 1;
+	}
+
+	hmac = malloc(hmac_len);
+	if(hmac == NULL){
+		fprintf(stderr,"Error: could not allocate memory for HMAC\n");
+		cleanup(NULL,NULL,ciphertext,packed_data,NULL);
+		return 1;
+	}
+
+	// unpack data
+	memcpy(kdf_salt,packed_data,KDF_SALTSIZ);
+	memcpy(init_vector,&(packed_data[KDF_SALTSIZ]),AES256_BLOCKSIZ);
+	memcpy(ciphertext,&(packed_data[KDF_SALTSIZ + AES256_BLOCKSIZ]),ciphertext_len);
+	memcpy(hmac,&(packed_data[KDF_SALTSIZ + AES256_BLOCKSIZ + ciphertext_len]),hmac_len);
+
+	// key derivation: PBKDF2 using SHA512 with 128 byte salt over 10 iterations into 64 byte key
+	err = gcry_kdf_derive(password,
+				strlen(password),
+				GCRY_KDF_PBKDF2,
+				GCRY_MD_SHA512,
+				kdf_salt,
+				KDF_SALTSIZ,
+				KDF_ITERATIONS,
+				KDF_KEYSIZ,
+				kdf_key);
+	if(err){
+		fprintf(stderr,"kdf_derive: %s/%s\n",gcry_strsource(err), gcry_strerror(err));
+		cleanup(NULL,NULL,ciphertext,packed_data,hmac);
+		return 1;
+	}
+
+	// copy the first 32 bytes of kdf_key into aes_key
+	memcpy(aes_key,kdf_key,AES256_KEYSIZ);
+
+	// copy the last 32 of kdf_key into hmac_key
+	memcpy(hmac_key,&(kdf_key[AES256_KEYSIZ]),HMAC_KEYSIZ);
+
+	// begin HMAC verification
+	err = gcry_mac_open(&mac,GCRY_MAC_HMAC_SHA512,0,NULL);
+	if(err){
+		fprintf(stderr,"mac_open during decryption: %s/%s\n",gcry_strsource(err), gcry_strerror(err));
+		cleanup(handle,NULL,ciphertext,packed_data,hmac);
+		return 1;
+	}
+
+	err = gcry_mac_setkey(mac,hmac_key,HMAC_KEYSIZ);
+	if(err){
+		fprintf(stderr,"mac_setkey during decryption: %s/%s\n",gcry_strsource(err), gcry_strerror(err));
+		cleanup(handle,mac,ciphertext,packed_data,hmac);
+		return 1;
+	}
+
+	err = gcry_mac_write(mac,packed_data,KDF_SALTSIZ+AES256_BLOCKSIZ+ciphertext_len);
+	if(err){
+		fprintf(stderr,"mac_write during decryption: %s/%s\n",gcry_strsource(err), gcry_strerror(err));
+		cleanup(handle,mac,ciphertext,packed_data,hmac);
+		return 1;
+	}
+
+	// verify HMAC
+	err = gcry_mac_verify(mac,hmac,hmac_len);
+	if(err){
+		fprintf(stderr,"HMAC verification failed: %s/%s\n",gcry_strsource(err), gcry_strerror(err));
+		cleanup(handle,mac,ciphertext,packed_data,hmac);
+		return 1;
+	}else{
+		printf("Valid HMAC found\n");
+	}
+
+	// being decryption
+	if(init_cipher(&handle,aes_key,init_vector)){
+		cleanup(handle,mac,ciphertext,packed_data,hmac);
+		return 1;
+	}
+
+	err = gcry_cipher_decrypt(handle,ciphertext,ciphertext_len,NULL,0);
+	if(err){
+		fprintf(stderr,"cipher_decrypt: %s/%s\n",gcry_strsource(err), gcry_strerror(err));
+		cleanup(handle,mac,ciphertext,packed_data,hmac);
+		return 1;
+	}
+
+	// write plaintext to the output file
+	if(!write_buf_to_file(outfile,ciphertext,ciphertext_len)){
+		fprintf(stderr,"0 bytes written\n");
+	}
+
+	cleanup(handle,mac,ciphertext,packed_data,hmac);
+
+	return 0;
+}
+
+void display_usage(){
+	puts("Usage: ./a.out [encrypt|decrypt] <infile path> <outfile path> <password>");
 }
 
 
-int main(int agrc, char *argv[]){
+int main(int argc, char **argv){
+	if(argc < 5){
+		fprintf(stderr,"Error: not anough args\n");
+		display_usage();
+		return 1;
+	}
+
+	if(strncmp(argv[1],"encrypt",7) == 0){
+		encrypt_file((char *)argv[2],(char *)argv[3],(char *)argv[4]);
+	}else if(strncmp(argv[1],"decrypt",7) == 0){
+		decrypt_file((char *)argv[2],(char *)argv[3],(char *)argv[4]);
+	}else{
+		fprintf(stderr,"Error: invalid action\n");
+		display_usage();
+		return 1;
+	}
+
+	return 0;
 }
